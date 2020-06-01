@@ -1,0 +1,257 @@
+#!/usr/bin/python3
+
+#axlogin implements a remote login service over AX.25.  You can run it normally
+# for a standard AX.25 terminal, or with the -n flag for something that still
+# likes actual newlines, like LInux's ax25_call.  You run it out of ax25d.conf
+# like so:
+# default * * * * * * - root /usr/local/bin/axlogin axlogin %S
+# The configuration is done in some variable declarations below, for the most part.
+# Pay special attention to the PAM service name. You'll need to specify a service
+# actually configured on your machine.  I highly recommend making a dedicated
+# service that only authenticates by way of TOTP or some such thing, because
+# one should not have passwords flying out over the air.
+#
+# Also note that once you're logged in, you may want to run stty -echo, since
+# due to some of the quirks of this setup, your commands will be echoed back to
+# you, otherwise.
+#
+# Christopher Smith (K0SIN), 2020
+
+import sys
+import time
+import signal
+import os
+import termios
+import threading
+import pam
+import tty
+import pty
+import argparse
+
+#My system seems to get "message too long" errors after about 16 bytes 
+#outbound at a time, so we double-buffer things and feed it out at that
+#rate.  Probably some MTU-thing.  May need adjustment, so:
+maxbuf = 14  #Flush output buffer to client when it gets this big
+
+#Maximum time in seconds to hold output without sending it.  Higher is more 
+#efficient, but interactivity will suffer after a point.
+restime = .4
+
+#You could use whichever service you like, but this seems like a reasonable one.
+#Note that this needs to exist in /etc/pam.d and have a reasonable authentication
+#mechanism configured.  The Python PAM module only supports a single password,
+#so if you are using something like pam_google_authenticator for OTP -- which I 
+#highly recommend you do, because when you log in over AX.25, you transmit your
+#password over the radio in clear text -- you will need to either use *just* the
+#OTP token, or set of the OTP module to do password chaining. by setting the 
+#google_authenticator module to use the forward_pass option and typing both
+#passwords at the same prompt as <OTPCODE><Password>.  Honestly, don't, because 
+#it can only be less secure.
+pamservice = 'ax25'
+
+userprompt = 'Login: '
+pwprompt = 'AUTH: '
+logintries = 3
+logintime = 180
+issuefile = '/etc/ax25/issue'
+
+#Seconds to allow a session to remain idle.
+sessiontime = 300
+
+#Probably good enough.
+os.environ['TERM']="vt100"
+
+optParser = argparse.ArgumentParser(description="Accept remote logins over AX.25")
+optParser.add_argument('-n','--newline',dest='nl',action='store_true',help='Leave the newline characters rather than trying to translate EOL into carriage-returns for the remote host.')
+optParser.add_argument('Callsign',help='Callsign of remote system.')
+opts = optParser.parse_args()
+
+if opts.nl:
+    eol = '\n'
+else:
+    eol = '\r'
+
+#If we're attached to a terminal, get a clean copy of the termio settings,
+#because we're going to be changing them around.`
+#If we're not attached to a terminal, we just need garbage strings to pass
+#to the function that checks to see.
+masterterm = ''
+termnoecho = ''
+if sys.stdin.isatty():
+    #We'll need to put these settings back later so that we don't mess up
+    #somebody's terminal.`
+    masterterm = termios.tcgetattr(sys.stdin.fileno())
+    #If we just assign a new variable equal to masterterm, we won't get an
+    #actual copy.  We want a second one with the echo disabled for the 
+    #password prompt
+    termnoecho = termios.tcgetattr(sys.stdin.fileno())
+    termnoecho[3] &= ~(termios.ICANON|termios.ECHO|termios.ECHOCTL)
+
+#Pythnon's print statement just won't let you not print a newline, so we can't
+#use it to do anything.
+def output(data):
+    sys.stdout.write(data)
+
+#Exit on SIGALRM
+def alarm(signum,frame):
+    disconnect()
+signal.signal(signal.SIGALRM,alarm)
+
+#We need to handle SIGINT by doing nothing
+def ignoresig(signum,frame):
+    pass
+signal.signal(signal.SIGINT,ignoresig)
+
+#Boot the user and exit.
+def disconnect():
+    output(eol + "Disconnecting.  Goodbye." + eol)
+    termreset(masterterm)
+    sys.exit(0)
+
+#Some simple terminal control, whether or not we're attached to a TTY device.
+def escape(command):
+        output("\033" + command)
+def echo():
+        global masterterm
+        if not termreset(masterterm):
+            escape("[28m")
+            #escape("[12h")
+def noecho():
+        global termnoecho
+        if not termreset(termnoecho):
+            escape("[8m")
+            #escape("[12l")
+
+#Reset the front-side terminal to more reasonable settings
+def termreset(context,term=sys.stdin.fileno()):
+    if (sys.stdin.isatty()):
+        termios.tcsetattr(term,termios.TCSANOW,context)
+        return True
+    return False
+#We should handle printing the issue file, if it exists.
+if os.path.isfile(issuefile):
+    issue = open(issuefile,"r")
+    #We'll need to do some odd things with the EOL characters.
+    issueout = []
+    for l in issue:
+        issueout.append(l.rstrip());
+    issue.close()
+    output(eol + eol.join(issueout) + eol)
+
+#Pre-authenticate here.
+authenticated = False
+authorizor = pam.pam()
+uname = 'nobody' #We'll need to pass this into login if we succeed here. 
+
+#Things like ax25_call are stupid enough to use CR to represent a newline 
+#on the local machine after printing status information.  Because of this,
+#we'll want to actually print a real line break, in case \r isn't it, so we
+#start on a clean line..
+output(eol)
+
+#We shouldn't take any logner than logintime seconds to authenticate
+watchdog = threading.Timer(logintime,lambda:os.kill(os.getpid(),signal.SIGALRM))
+watchdog.start()
+
+for logintry in range(logintries):
+        uname = input(userprompt).rstrip()
+        output(pwprompt)
+        noecho()
+        pw = input().rstrip()
+        echo()
+        output(eol)
+        if authorizor.authenticate(uname,pw,pamservice):
+            authenticated = True
+            break
+        else:
+            output("Authentication failed." + eol)
+
+#Done with authentication.  Cancel timeout timer.
+watchdog.cancel()
+
+if not authenticated:
+    disconnect()
+
+#Fork with result attached to PTY
+(loginproc,loginfd) = pty.fork()
+
+if loginproc:
+    #This is the master process
+    #Make our reads non-Blocking
+    os.set_blocking(loginfd,False)
+    os.set_blocking(sys.stdin.fileno(),False)
+
+
+    obuf = []
+    ibuf = []
+    iflushtime = time.time()
+    oflushtime = time.time()
+    inputtime = time.time()
+
+    while (True):
+        #Flush the output buffer.  This way we get efficient, reasonably large
+        #packets going out.  We can't control the inbound ones, so just handle
+        #that one byte at a time later on.  The OS will buffer those for us.`
+        if ((time.time() > oflushtime+restime or len(obuf) >= maxbuf) and len(obuf) > 0):
+            while len(obuf):    #Always flush in chunks of maxbuf, at most.
+                os.write(sys.stdout.fileno(),b"".join(obuf[:maxbuf]))
+                obuf = obuf[maxbuf:]
+            oflushtime = time.time()   
+        #Now handle input similarly
+        if ((time.time() > iflushtime+restime or len(ibuf) >= maxbuf) and len(ibuf) > 0):
+            while len(ibuf):
+                os.write(loginfd,b"".join(ibuf[:maxbuf]))
+                ibuf = ibuf[maxbuf:]
+            iflushtime = time.time()
+        try:
+            #Why is this so incredibly stupid?  I can't, for some reason, 
+            #read small chunks of this incoming data.  It seems like after
+            #the read, the rest of the data I'd read next just gets thrown 
+            #out, even if I execute another read right after.`
+            t = os.read(sys.stdin.fileno(),256) #That should be enough, right?
+        except BlockingIOError: #No data
+            pass;
+        except OSError: #Closed, probably; break from main loop
+            output("Session closed." + eol)
+            break;
+        else:
+            #Record time of most recent user activity
+            inputtime = time.time()
+            #Translate CR->NL for the server
+            if (not opts.nl):
+                t=t.replace(bytes([13]),bytes([10]))
+            ibuf.append(t)
+        try:
+            t = os.read(loginfd,maxbuf)
+        except BlockingIOError:
+            pass
+        except OSError: #Closed, probably
+            output("Session closed." + eol)
+            break;
+        else:
+            if (not opts.nl): #Translate NL->CR for the client
+                    t = t.replace(bytes([10]),bytes([13]))
+            obuf.append(t)
+        #Having taken care of all the I/O, should we time the user out?
+        if (time.time() - inputtime > sessiontime):
+            output("Timed out due to inactivity." + eol)
+            os.kill(loginproc,signal.SIGTERM)
+            disconnect()
+else:
+    #This will be our actual running login
+#Breaks for some reason.
+    tty.setraw(sys.stdin.fileno(),termios.TCSANOW)
+    #Just erase the whole current environment.  We're about to make a login shell.
+    for var in os.environ:
+        del os.environ[var]
+
+    #Set some new environment variables for login
+    os.environ["TERM"] = "vt100"
+    os.environ["AX25_STATION"] = opts.Callsign
+    os.execl("/bin/login","login","-p","-f",uname,"-h","AX.25:" + opts.Callsign)
+    sys.exit(0) #We should never hit this.
+
+#Clean up terminal settings before exit.
+termreset(masterterm)
+
+
