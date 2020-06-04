@@ -33,6 +33,10 @@ import argparse
 #rate.  Probably some MTU-thing.  May need adjustment, so:
 maxbuf = 14  #Flush output buffer to client when it gets this big
 
+#We seem to need to flush output from our output() function after a somewhat
+# different maximum size, let's say a few lies and no more.
+maxout = 200
+
 #Maximum time in seconds to hold output without sending it.  Higher is more 
 #efficient, but interactivity will suffer after a point.
 restime = .4
@@ -90,7 +94,10 @@ if sys.stdin.isatty():
 #Pythnon's print statement just won't let you not print a newline, so we can't
 #use it to do anything.
 def output(data):
-    sys.stdout.write(data)
+    while len(data):
+        sys.stdout.write(data[:maxout])
+        data = data[maxout:]
+        sys.stdout.flush()
 
 #Exit on SIGALRM
 def alarm(signum,frame):
@@ -128,13 +135,16 @@ def termreset(context,term=sys.stdin.fileno()):
         termios.tcsetattr(term,termios.TCSANOW,context)
         return True
     return False
+
+output(eol)
+
 #We should handle printing the issue file, if it exists.
 if os.path.isfile(issuefile):
     issue = open(issuefile,"r")
     #We'll need to do some odd things with the EOL characters.
     issueout = []
     for l in issue:
-        issueout.append(l.rstrip());
+        issueout.append(l.rstrip())
     issue.close()
     output(eol + eol.join(issueout) + eol)
 
